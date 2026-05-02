@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dotnet clean:*)",
+      "Bash(dotnet build:*)",
+      "Bash(unzip -l \"C:/Users/warro/source/repos/HikVision/HikVision/bin/Debug/net8.0/LocalXml.zip\")",
+      "Bash(grep \"define\\\\|comment\\\\|//\")",
+      "Bash(dotnet run:*)",
+      "Bash(curl:*)",
+      "Bash(taskkill /F /IM dotnet.exe)",
+      "Bash(taskkill //F //IM dotnet.exe)"
+    ]
+  }
+}
