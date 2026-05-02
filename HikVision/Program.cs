@@ -6,6 +6,31 @@ using HikVision.Handlers;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Map short CLI argument names to their full configuration keys.
+// Usage examples:
+//   --ip 192.168.250.201
+//   --username admin --password secret
+//   --bind http://0.0.0.0:5077
+//   --forward-url http://laravel.local/hikvision/callback
+builder.Configuration.AddCommandLine(args, new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+{
+    ["--ip"]               = "HikVision:DeviceIp",
+    ["--serial"]           = "HikVision:DeviceSerial",
+    ["--username"]         = "HikVision:Username",
+    ["-u"]                 = "HikVision:Username",
+    ["--password"]         = "HikVision:Password",
+    ["-p"]                 = "HikVision:Password",
+    ["--http-port"]        = "HikVision:HttpPort",
+    ["--sdk-port"]         = "HikVision:SdkPort",
+    ["--timeout"]          = "HikVision:TimeoutSeconds",
+    ["--bind"]             = "HikVision:BindUrl",
+    ["--callback-path"]    = "HikVision:CallbackPath",
+    ["--callback-token"]   = "HikVision:CallbackToken",
+    ["--callback-host-id"] = "HikVision:CallbackHostId",
+    ["--forward-url"]      = "HikVision:ForwardUrl",
+    ["--forward-token"]    = "HikVision:ForwardToken",
+});
+
 var logsPath = Path.Combine(AppContext.BaseDirectory, "logs");
 Directory.CreateDirectory(logsPath);
 
@@ -26,10 +51,73 @@ try
     var config = builder.Configuration.GetSection("HikVision").Get<HikVisionConfig>()
         ?? throw new InvalidOperationException("HikVision configuration not found in appsettings.json");
 
+    // Auto-discover DeviceIp via SADP UDP broadcast if not set in configuration
+    if (string.IsNullOrWhiteSpace(config.DeviceIp))
+    {
+        Log.Information("DeviceIp not configured — starting SADP auto-discovery...");
+        var discovered = await HikVision.Services.HikVisionDeviceDiscovery.DiscoverDevicesAsync();
+
+        if (discovered.Count == 0)
+        {
+            Log.Warning(
+                "SADP: No Hikvision devices were found on the network. " +
+                "Set DeviceIp in appsettings.json to connect to a specific device.");
+        }
+        else
+        {
+            if (discovered.Count > 1)
+            {
+                Log.Warning(
+                    "SADP: Multiple devices found ({Count}). Using the first one: {IP}. " +
+                    "Set DeviceIp in appsettings.json to choose a specific device.",
+                    discovered.Count,
+                    discovered[0].IpAddress);
+            }
+
+            config.DeviceIp = discovered[0].IpAddress;
+
+            if (string.IsNullOrWhiteSpace(config.DeviceSerial) && discovered[0].SerialNumber is not null)
+            {
+                config.DeviceSerial = discovered[0].SerialNumber;
+            }
+
+            Log.Information("SADP: Using device IP: {IP}", config.DeviceIp);
+        }
+    }
+
+    // Auto-fetch DeviceSerial from the device via ISAPI if not set (only if DeviceIp is known)
+    if (string.IsNullOrWhiteSpace(config.DeviceSerial) && !string.IsNullOrWhiteSpace(config.DeviceIp))
+    {
+        Log.Information("DeviceSerial not configured — fetching from device at {IP}...", config.DeviceIp);
+        try
+        {
+            using var tempClient = new HikVision.Services.HikVisionIsapiClient(config);
+            var (success, serial, deviceType, firmware) = await tempClient.GetDeviceInfoAsync();
+
+            if (success && !string.IsNullOrWhiteSpace(serial))
+            {
+                config.DeviceSerial = serial;
+                Log.Information("Auto-detected device — Serial: {Serial}, Type: {Type}, Firmware: {Firmware}",
+                    serial, deviceType, firmware);
+            }
+            else
+            {
+                Log.Warning("Could not auto-fetch DeviceSerial from device. Will retry after first callback.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to fetch device info from {IP}", config.DeviceIp);
+        }
+    }
+
+    Log.Information("Device configured — IP: {IP}, Serial: {Serial}", config.DeviceIp, config.DeviceSerial);
+
     builder.Services.AddSingleton(config);
     builder.Services.AddSingleton<HikVisionSdkClient>();
     builder.Services.AddSingleton<HikVisionIsapiClient>();
     builder.Services.AddSingleton<AttendanceCallbackProbeService>();
+    builder.Services.AddSingleton<DeviceAutoConfigService>();
     builder.Services.AddHttpClient<AttendanceForwardService>();
 
     var app = builder.Build();
@@ -93,7 +181,7 @@ try
     var hikVisionIsapiClient = app.Services.GetRequiredService<HikVisionIsapiClient>();
     var callbackUrl = AttendanceCallbackConfigHandler.ResolveCallbackUrl(config);
 
-    if (!string.IsNullOrWhiteSpace(callbackUrl))
+    if (!string.IsNullOrWhiteSpace(callbackUrl) && !string.IsNullOrWhiteSpace(config.DeviceIp))
     {
         try
         {
@@ -116,7 +204,10 @@ try
     }
     else
     {
-        Log.Information("Skipping attendance callback auto-configuration because no reachable callback URL could be resolved");
+        if (string.IsNullOrWhiteSpace(config.DeviceIp))
+            Log.Information("Skipping attendance callback auto-configuration — DeviceIp not yet known. Will register after first callback.");
+        else
+            Log.Information("Skipping attendance callback auto-configuration because no reachable callback URL could be resolved");
     }
 
     Log.Information("Hikvision Helper starting on {BindUrl}", config.BindUrl);

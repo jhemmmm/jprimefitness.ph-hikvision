@@ -10,7 +10,8 @@ public static class AttendanceCallbackReceiveHandler
     public static async Task<IResult> Handle(
         HttpRequest request,
         AttendanceCallbackProbeService attendanceCallbackProbeService,
-        AttendanceForwardService attendanceForwardService)
+        AttendanceForwardService attendanceForwardService,
+        HikVision.Services.DeviceAutoConfigService deviceAutoConfigService)
     {
         var logger = Log.ForContext(typeof(AttendanceCallbackReceiveHandler));
 
@@ -42,6 +43,11 @@ public static class AttendanceCallbackReceiveHandler
         snapshot.NormalizedEvent = attendanceForwardService.NormalizePayload(snapshot);
         snapshot.ForwardResult = await attendanceForwardService.ForwardAsync(snapshot.NormalizedEvent);
         snapshot = attendanceCallbackProbeService.Record(snapshot);
+
+        // Auto-configure device IP/serial on first callback if SADP discovery found nothing
+        deviceAutoConfigService.TryLearnFromCallback(
+            snapshot.NormalizedEvent?.DeviceIp,
+            snapshot.NormalizedEvent?.DeviceName);
 
         logger.Information(
             "Received helper attendance callback #{CallbackCount} from {RemoteIpAddress} {Method} {Path}{QueryString} employee={EmployeeNo} serial={SerialNo} forwardStatus={ForwardStatus} body={Body}",

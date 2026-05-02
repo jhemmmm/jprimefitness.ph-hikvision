@@ -2,11 +2,17 @@ namespace HikVision.Config;
 
 public class HikVisionConfig
 {
-    public required string DeviceIp { get; set; }
+    /// <summary>
+    /// IP address of the Hikvision device. If not set, auto-discovered via SADP broadcast.
+    /// </summary>
+    public string? DeviceIp { get; set; }
     public int HttpPort { get; set; } = 80;
     public int SdkPort { get; set; } = 8000;
     public required string Username { get; set; }
     public required string Password { get; set; }
+    /// <summary>
+    /// Serial number of the device. If not set, fetched automatically from the device on startup.
+    /// </summary>
     public string? DeviceSerial { get; set; }
     public int TimeoutSeconds { get; set; } = 30;
     public string BindUrl { get; set; } = "http://127.0.0.1:5077";

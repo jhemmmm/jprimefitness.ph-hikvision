@@ -25,11 +25,97 @@ public class HikVisionIsapiClient : IDisposable
             PreAuthenticate = false  // let device challenge first, then reply with Digest
         };
 
+        // BaseAddress is intentionally NOT set — DeviceIp may be null at construction time
+        // and cannot be changed on HttpClient after the first request. Use DeviceUrl() instead.
         _httpClient = new HttpClient(handler)
         {
-            BaseAddress = new Uri($"http://{_config.DeviceIp}:{_config.HttpPort}"),
             Timeout = TimeSpan.FromSeconds(10)
         };
+    }
+
+    /// <summary>
+    /// Builds a full absolute URI for the given ISAPI path using the current DeviceIp.
+    /// Throws <see cref="InvalidOperationException"/> if DeviceIp is not yet configured.
+    /// </summary>
+    private string DeviceUrl(string path)
+    {
+        if (string.IsNullOrWhiteSpace(_config.DeviceIp))
+            throw new InvalidOperationException(
+                "DeviceIp is not configured. The device has not yet been discovered or set in appsettings.json.");
+
+        var base_ = $"http://{_config.DeviceIp}:{_config.HttpPort}";
+        return path.StartsWith('/') ? base_ + path : base_ + "/" + path;
+    }
+
+    /// <summary>
+    /// Fetches device information (serial number, model, firmware) from /ISAPI/System/deviceInfo.
+    /// </summary>
+    public async Task<(bool Success, string? SerialNumber, string? DeviceType, string? FirmwareVersion)> GetDeviceInfoAsync()
+    {
+        try
+        {
+            var response = await _httpClient.GetAsync(DeviceUrl("/ISAPI/System/deviceInfo?format=json"));
+            var body = await response.Content.ReadAsStringAsync();
+
+            if (response.IsSuccessStatusCode)
+            {
+                // Some devices ignore ?format=json and always return XML — handle both
+                try
+                {
+                    using var doc = JsonDocument.Parse(body);
+                    var root = doc.RootElement;
+                    var info = root.TryGetProperty("DeviceInfo", out var di) ? di : root;
+
+                    var serial = ReadJsonString(info, "serialNumber");
+                    var deviceType = ReadJsonString(info, "deviceType") ?? ReadJsonString(info, "model");
+                    var firmware = ReadJsonString(info, "firmwareVersion");
+
+                    return (true, serial, deviceType, firmware);
+                }
+                catch (JsonException)
+                {
+                    // Device returned XML despite ?format=json — fall through to XML parsing below
+                    return ParseDeviceInfoXml(body);
+                }
+            }
+
+            // Fallback: try plain XML endpoint
+            response = await _httpClient.GetAsync(DeviceUrl("/ISAPI/System/deviceInfo"));
+            body = await response.Content.ReadAsStringAsync();
+
+            if (!response.IsSuccessStatusCode)
+            {
+                Log.Warning("ISAPI: Could not fetch device info. HTTP {StatusCode}", response.StatusCode);
+                return (false, null, null, null);
+            }
+
+            return ParseDeviceInfoXml(body);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "ISAPI: Failed to retrieve device info");
+            return (false, null, null, null);
+        }
+    }
+
+    private static (bool Success, string? SerialNumber, string? DeviceType, string? FirmwareVersion) ParseDeviceInfoXml(string xml)
+    {
+        try
+        {
+            var xmlDoc = System.Xml.Linq.XDocument.Parse(xml);
+            var ns = xmlDoc.Root?.Name.Namespace ?? System.Xml.Linq.XNamespace.None;
+
+            string? GetXmlValue(string name) =>
+                xmlDoc.Descendants(ns + name).FirstOrDefault()?.Value?.Trim()
+                ?? xmlDoc.Descendants(name).FirstOrDefault()?.Value?.Trim();
+
+            return (true, GetXmlValue("serialNumber"), GetXmlValue("deviceType") ?? GetXmlValue("model"), GetXmlValue("firmwareVersion"));
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "ISAPI: Failed to parse device info XML");
+            return (false, null, null, null);
+        }
     }
 
     public async Task<(string Status, string Message, int HttpStatusCode, string? RawStatus, string? RawResponse)> SetupFingerprintAsync(
@@ -238,7 +324,7 @@ public class HikVisionIsapiClient : IDisposable
     /// </summary>
     public async Task<string> GetAccessControlCapabilitiesXmlAsync()
     {
-        var response = await _httpClient.GetAsync("/ISAPI/AccessControl/capabilities");
+        var response = await _httpClient.GetAsync(DeviceUrl("/ISAPI/AccessControl/capabilities"));
         response.EnsureSuccessStatusCode();
 
         var xml = await response.Content.ReadAsStringAsync();
@@ -353,7 +439,7 @@ public class HikVisionIsapiClient : IDisposable
 
             var json = JsonSerializer.Serialize(requestBody);
             var response = await _httpClient.PostAsync(
-                "/ISAPI/AccessControl/UserInfo/Search?format=json",
+                DeviceUrl("/ISAPI/AccessControl/UserInfo/Search?format=json"),
                 new StringContent(json, System.Text.Encoding.UTF8, "application/json"));
 
             var responseBody = await response.Content.ReadAsStringAsync();
@@ -422,7 +508,7 @@ public class HikVisionIsapiClient : IDisposable
             });
 
             var response = await _httpClient.PostAsync(
-                "/ISAPI/AccessControl/AcsEvent?format=json",
+                DeviceUrl("/ISAPI/AccessControl/AcsEvent?format=json"),
                 new StringContent(json, System.Text.Encoding.UTF8, "application/json"));
 
             var responseBody = await response.Content.ReadAsStringAsync();
@@ -506,7 +592,7 @@ public class HikVisionIsapiClient : IDisposable
             };
 
             var response = await _httpClient.PutAsync(
-                $"/ISAPI/Event/notification/httpHosts/{resolvedHostId}",
+                DeviceUrl($"/ISAPI/Event/notification/httpHosts/{resolvedHostId}"),
                 new StringContent(BuildCallbackXml(callbackUrl, resolvedHostId), System.Text.Encoding.UTF8, "application/xml"));
 
             if (!response.IsSuccessStatusCode)
@@ -590,7 +676,7 @@ public class HikVisionIsapiClient : IDisposable
                 json);
 
             var response = await _httpClient.PostAsync(
-                "/ISAPI/AccessControl/FingerPrint/SetUp?format=json",
+                DeviceUrl("/ISAPI/AccessControl/FingerPrint/SetUp?format=json"),
                 content);
 
             if (response.StatusCode == HttpStatusCode.NotFound || response.StatusCode == HttpStatusCode.MethodNotAllowed)
@@ -647,7 +733,7 @@ public class HikVisionIsapiClient : IDisposable
         try
         {
             var response = await _httpClient.GetAsync(
-                "/ISAPI/AccessControl/FingerPrint/SetUpStatus?format=json");
+                DeviceUrl("/ISAPI/AccessControl/FingerPrint/SetUpStatus?format=json"));
 
             if (!response.IsSuccessStatusCode)
             {
@@ -699,7 +785,7 @@ public class HikVisionIsapiClient : IDisposable
         {
             Log.Information("ISAPI: POST /ISAPI/AccessControl/FingerPrint/Cancel (cleanup)");
             var response = await _httpClient.PostAsync(
-                "/ISAPI/AccessControl/FingerPrint/Cancel?format=json",
+                DeviceUrl("/ISAPI/AccessControl/FingerPrint/Cancel?format=json"),
                 new StringContent("", System.Text.Encoding.UTF8, "application/json"));
 
             if (response.IsSuccessStatusCode)
@@ -723,7 +809,7 @@ public class HikVisionIsapiClient : IDisposable
 
         while (DateTime.UtcNow < deadline)
         {
-            var response = await _httpClient.GetAsync("/ISAPI/AccessControl/UserInfoDetail/DeleteProcess?format=json");
+            var response = await _httpClient.GetAsync(DeviceUrl("/ISAPI/AccessControl/UserInfoDetail/DeleteProcess?format=json"));
             var responseBody = await response.Content.ReadAsStringAsync();
 
             if (!response.IsSuccessStatusCode)
@@ -768,7 +854,7 @@ public class HikVisionIsapiClient : IDisposable
         {
             DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
         });
-        var request = new HttpRequestMessage(method, path)
+        var request = new HttpRequestMessage(method, new Uri(DeviceUrl(path)))
         {
             Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json")
         };
