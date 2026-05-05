@@ -58,6 +58,56 @@ dotnet run --project HikVision.csproj
 
 The helper listens on `http://0.0.0.0:5077` and writes rolling logs to `logs/hikvision-helper-<date>.txt`.
 
+### Running with Arguments
+
+Any setting from `appsettings.json` can be overridden at the command line without editing the file. Arguments take precedence over `appsettings.json`.
+
+```bash
+dotnet run --project HikVision.csproj -- [arguments]
+```
+
+> Note the `--` separator between `dotnet run` options and the application arguments.
+
+#### All available arguments
+
+| Argument | Short | Config key | Default |
+|---|---|---|---|
+| `--ip` | | `DeviceIp` | *(auto-detected)* |
+| `--serial` | | `DeviceSerial` | *(auto-detected)* |
+| `--username` | `-u` | `Username` | *(required)* |
+| `--password` | `-p` | `Password` | *(required)* |
+| `--http-port` | | `HttpPort` | `80` |
+| `--sdk-port` | | `SdkPort` | `8000` |
+| `--timeout` | | `TimeoutSeconds` | `30` |
+| `--bind` | | `BindUrl` | `http://0.0.0.0:5077` |
+| `--callback-path` | | `CallbackPath` | `/attendance/callback` |
+| `--callback-token` | | `CallbackToken` | *(none)* |
+| `--callback-host-id` | | `CallbackHostId` | `2` |
+| `--forward-url` | | `ForwardUrl` | *(none)* |
+| `--forward-token` | | `ForwardToken` | *(none)* |
+
+#### Examples
+
+Minimal — just supply credentials and let the device be auto-discovered:
+```bash
+dotnet run --project HikVision.csproj -- -u admin -p secret
+```
+
+Point at a specific device and forward events to Laravel:
+```bash
+dotnet run --project HikVision.csproj -- --ip 192.168.250.201 -u admin -p secret --forward-url http://laravel.local/hikvision/callback --forward-token abc123
+```
+
+Change the port the helper listens on:
+```bash
+dotnet run --project HikVision.csproj -- --bind http://0.0.0.0:9000
+```
+
+Run the published binary directly (no `dotnet run` wrapper):
+```bash
+HikVision.exe --ip 192.168.250.201 -u admin -p secret
+```
+
 ## API Endpoints
 
 ### `GET /health`
