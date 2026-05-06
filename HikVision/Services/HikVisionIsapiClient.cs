@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text.Json;
+using System.Xml.Linq;
 using Serilog;
 using HikVision.Config;
 
@@ -12,11 +13,13 @@ namespace HikVision.Services;
 public class HikVisionIsapiClient : IDisposable
 {
     private readonly HikVisionConfig _config;
+    private readonly HikVisionDeviceState _deviceState;
     private readonly HttpClient _httpClient;
 
-    public HikVisionIsapiClient(HikVisionConfig config)
+    public HikVisionIsapiClient(HikVisionConfig config, HikVisionDeviceState deviceState)
     {
         _config = config;
+        _deviceState = deviceState;
 
         // HttpClientHandler with NetworkCredential for automatic Digest auth
         var handler = new HttpClientHandler
@@ -29,7 +32,7 @@ public class HikVisionIsapiClient : IDisposable
         // and cannot be changed on HttpClient after the first request. Use DeviceUrl() instead.
         _httpClient = new HttpClient(handler)
         {
-            Timeout = TimeSpan.FromSeconds(10)
+            Timeout = TimeSpan.FromSeconds(HikVisionDefaults.RequestTimeoutSeconds)
         };
     }
 
@@ -39,11 +42,7 @@ public class HikVisionIsapiClient : IDisposable
     /// </summary>
     private string DeviceUrl(string path)
     {
-        if (string.IsNullOrWhiteSpace(_config.DeviceIp))
-            throw new InvalidOperationException(
-                "DeviceIp is not configured. The device has not yet been discovered or set in appsettings.json.");
-
-        var base_ = $"http://{_config.DeviceIp}:{_config.HttpPort}";
+        var base_ = $"http://{_deviceState.RequireDeviceIp()}:{HikVisionDefaults.HttpPort}";
         return path.StartsWith('/') ? base_ + path : base_ + "/" + path;
     }
 
@@ -546,7 +545,7 @@ public class HikVisionIsapiClient : IDisposable
                         SerialNo = ReadJsonInt(item, "serialNo"),
                         Major = ReadJsonInt(item, "major"),
                         Minor = ReadJsonInt(item, "minor"),
-                        DeviceSerial = _config.DeviceSerial,
+                        DeviceSerial = _deviceState.DeviceSerial,
                         RawPayload = item.GetRawText()
                     });
                 }
@@ -572,54 +571,137 @@ public class HikVisionIsapiClient : IDisposable
     {
         try
         {
-            var resolvedHostId = hostId ?? _config.CallbackHostId;
-            var requestBody = new
+            var resolvedHostId = hostId ?? HikVisionDefaults.CallbackHostId;
+            var preferredEventFormat = await GetConfiguredCallbackEventFormatAsync(resolvedHostId);
+
+            if (string.Equals(preferredEventFormat, "XML", StringComparison.OrdinalIgnoreCase))
             {
-                HttpHostNotification = new
+                Log.Information("ISAPI: Callback host {HostId} prefers XML event format", resolvedHostId);
+                var xmlResult = await RegisterXmlCallbackAsync(callbackUrl, resolvedHostId);
+                if (xmlResult.Status == "success")
                 {
-                    id = resolvedHostId,
-                    url = callbackUrl,
-                    protocolType = callbackUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ? "HTTPS" : "HTTP",
-                    parameterFormatType = "json",
-                    addressingFormatType = "ipaddress",
-                    ipAddress = ExtractHost(callbackUrl),
-                    portNo = ExtractPort(callbackUrl),
-                    SubscribeEvent = new
-                    {
-                        eventMode = "all"
-                    }
+                    return xmlResult;
                 }
-            };
 
-            var response = await _httpClient.PutAsync(
-                DeviceUrl($"/ISAPI/Event/notification/httpHosts/{resolvedHostId}"),
-                new StringContent(BuildCallbackXml(callbackUrl, resolvedHostId), System.Text.Encoding.UTF8, "application/xml"));
-
-            if (!response.IsSuccessStatusCode)
-            {
-                var xmlResponseBody = await response.Content.ReadAsStringAsync();
-                Log.Warning(
-                    "ISAPI: XML callback registration failed. HTTP {StatusCode}: {Body}",
-                    response.StatusCode,
-                    xmlResponseBody);
-
-                var fallback = await SendJsonRequestAsync(
-                    HttpMethod.Put,
-                    "/ISAPI/Event/notification/httpHosts?format=json",
-                    requestBody,
-                    "ISAPI: Callback registration");
-
-                return (fallback.Status, fallback.Message, fallback.HttpStatusCode, callbackUrl, resolvedHostId, fallback.RawResponse);
+                Log.Information("ISAPI: XML callback registration was not accepted. Trying JSON event format.");
+                return await RegisterJsonCallbackAsync(callbackUrl, resolvedHostId, logFailureAsWarning: true);
             }
 
-            var body = await response.Content.ReadAsStringAsync();
-            return ("success", "Attendance callback configured successfully", (int)response.StatusCode, callbackUrl, resolvedHostId, body);
+            var jsonResult = await RegisterJsonCallbackAsync(callbackUrl, resolvedHostId, logFailureAsWarning: false);
+            if (jsonResult.Status == "success")
+            {
+                return jsonResult;
+            }
+
+            Log.Information("ISAPI: JSON callback registration was not accepted. Trying XML event format.");
+            return await RegisterXmlCallbackAsync(callbackUrl, resolvedHostId);
         }
         catch (Exception ex)
         {
             Log.Error(ex, "ISAPI: Unexpected error during callback configuration");
-            return ("failed", $"Error: {ex.Message}", 0, callbackUrl, hostId ?? _config.CallbackHostId, null);
+            return ("failed", $"Error: {ex.Message}", 0, callbackUrl, hostId ?? HikVisionDefaults.CallbackHostId, null);
         }
+    }
+
+    private async Task<(string Status, string Message, int HttpStatusCode, string? CallbackUrl, int HostId, string? RawResponse)> RegisterJsonCallbackAsync(
+        string callbackUrl,
+        int hostId,
+        bool logFailureAsWarning)
+    {
+        var requestBody = new
+        {
+            HttpHostNotification = new
+            {
+                id = hostId,
+                url = callbackUrl,
+                protocolType = callbackUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ? "HTTPS" : "HTTP",
+                parameterFormatType = "JSON",
+                addressingFormatType = "ipaddress",
+                ipAddress = ExtractHost(callbackUrl),
+                portNo = ExtractPort(callbackUrl),
+                httpAuthenticationMethod = "none",
+                SubscribeEvent = new
+                {
+                    eventMode = "all"
+                }
+            }
+        };
+
+        var result = await SendJsonRequestAsync(
+            HttpMethod.Put,
+            $"/ISAPI/Event/notification/httpHosts/{hostId}?format=json",
+            requestBody,
+            "ISAPI: Callback registration",
+            logFailureAsWarning);
+
+        if (result.Status == "success")
+        {
+            Log.Information("ISAPI: Callback registration succeeded using JSON event format");
+        }
+
+        return (result.Status, result.Message, result.HttpStatusCode, callbackUrl, hostId, result.RawResponse);
+    }
+
+    private async Task<(string Status, string Message, int HttpStatusCode, string? CallbackUrl, int HostId, string? RawResponse)> RegisterXmlCallbackAsync(
+        string callbackUrl,
+        int hostId)
+    {
+        Log.Information("ISAPI: Callback registration: PUT /ISAPI/Event/notification/httpHosts/{HostId} using XML event format", hostId);
+        Log.Debug("ISAPI: Callback registration XML body={Body}", BuildCallbackXml(callbackUrl, hostId, "XML"));
+
+        var response = await _httpClient.PutAsync(
+            DeviceUrl($"/ISAPI/Event/notification/httpHosts/{hostId}"),
+            new StringContent(BuildCallbackXml(callbackUrl, hostId, "XML"), System.Text.Encoding.UTF8, "application/xml"));
+
+        var body = await response.Content.ReadAsStringAsync();
+        if (!response.IsSuccessStatusCode)
+        {
+            Log.Warning("ISAPI: XML callback registration failed. HTTP {StatusCode}", response.StatusCode);
+            Log.Debug("ISAPI: XML callback registration response body: {Body}", body);
+
+            return (
+                MapHttpStatusToStatusCode((int)response.StatusCode, body),
+                $"Callback registration failed. HTTP {response.StatusCode}. Response: {body}",
+                (int)response.StatusCode,
+                callbackUrl,
+                hostId,
+                body);
+        }
+
+        Log.Information("ISAPI: Callback registration succeeded using XML event format");
+        return ("success", "Attendance callback configured successfully using XML event format", (int)response.StatusCode, callbackUrl, hostId, body);
+    }
+
+    private async Task<string?> GetConfiguredCallbackEventFormatAsync(int hostId)
+    {
+        try
+        {
+            var response = await _httpClient.GetAsync(DeviceUrl($"/ISAPI/Event/notification/httpHosts/{hostId}"));
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            var body = await response.Content.ReadAsStringAsync();
+            var document = XDocument.Parse(body);
+            var parameterFormatType = document
+                .Descendants()
+                .FirstOrDefault(element => element.Name.LocalName == "parameterFormatType")
+                ?.Value
+                ?.Trim();
+
+            if (string.Equals(parameterFormatType, "XML", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(parameterFormatType, "JSON", StringComparison.OrdinalIgnoreCase))
+            {
+                return parameterFormatType?.ToUpperInvariant();
+            }
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException or System.Xml.XmlException)
+        {
+            Log.Debug(ex, "ISAPI: Could not read current callback host format");
+        }
+
+        return null;
     }
 
     private Task<(bool Success, string Status, string Message, int HttpStatusCode, string? RawStatus, string? RawResponse)> StartFingerprintCaptureAsync(
@@ -670,7 +752,7 @@ public class HikVisionIsapiClient : IDisposable
             });
             var content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
 
-            Log.Information(
+            Log.Debug(
                 "ISAPI: POST /ISAPI/AccessControl/FingerPrint/SetUp ({Mode}) with body: {Body}",
                 deleteFingerPrint ? "delete" : "setup",
                 json);
@@ -690,8 +772,8 @@ public class HikVisionIsapiClient : IDisposable
             if (!response.IsSuccessStatusCode)
             {
                 Log.Error("ISAPI: PUT failed. HTTP {StatusCode}", response.StatusCode);
-                Log.Error("ISAPI: Response body: {Body}", responseBody);
-                Log.Error("ISAPI: Request was: {Json}", json);
+                Log.Debug("ISAPI: Response body: {Body}", responseBody);
+                Log.Debug("ISAPI: Request was: {Json}", json);
                 return (
                     false,
                     MapHttpStatusToStatusCode((int)response.StatusCode, responseBody),
@@ -703,7 +785,7 @@ public class HikVisionIsapiClient : IDisposable
             }
 
             Log.Information("ISAPI: SetUp succeeded (HTTP {StatusCode})", response.StatusCode);
-            Log.Information("ISAPI: SetUp response body: {Body}", responseBody);
+            Log.Debug("ISAPI: SetUp response body: {Body}", responseBody);
 
             var responseStatus = ExtractFingerprintStatus(responseBody);
             var successState = deleteFingerPrint ? "success" : "collecting";
@@ -738,7 +820,8 @@ public class HikVisionIsapiClient : IDisposable
             if (!response.IsSuccessStatusCode)
             {
                 var body = await response.Content.ReadAsStringAsync();
-                Log.Warning("ISAPI: GET status failed. HTTP {StatusCode}: {Body}", response.StatusCode, body);
+                Log.Warning("ISAPI: GET status failed. HTTP {StatusCode}", response.StatusCode);
+                Log.Debug("ISAPI: GET status response body: {Body}", body);
                 return ("error_polling", (int)response.StatusCode, body);
             }
 
@@ -848,7 +931,8 @@ public class HikVisionIsapiClient : IDisposable
         HttpMethod method,
         string path,
         object requestBody,
-        string logLabel)
+        string logLabel,
+        bool logFailureAsWarning = true)
     {
         var json = JsonSerializer.Serialize(requestBody, new JsonSerializerOptions
         {
@@ -859,14 +943,24 @@ public class HikVisionIsapiClient : IDisposable
             Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json")
         };
 
-        Log.Information("{LogLabel}: {Method} {Path} with body: {Body}", logLabel, method, path, json);
+        Log.Information("{LogLabel}: {Method} {Path}", logLabel, method, path);
+        Log.Debug("{LogLabel}: {Method} {Path} body={Body}", logLabel, method, path, json);
 
         var response = await _httpClient.SendAsync(request);
         var responseBody = await response.Content.ReadAsStringAsync();
 
         if (!response.IsSuccessStatusCode)
         {
-            Log.Warning("{LogLabel} failed. HTTP {StatusCode}: {Body}", logLabel, response.StatusCode, responseBody);
+            if (logFailureAsWarning)
+            {
+                Log.Warning("{LogLabel} failed. HTTP {StatusCode}", logLabel, response.StatusCode);
+            }
+            else
+            {
+                Log.Debug("{LogLabel} failed. HTTP {StatusCode}", logLabel, response.StatusCode);
+            }
+
+            Log.Debug("{LogLabel} response body: {Body}", logLabel, responseBody);
 
             return (
                 MapHttpStatusToStatusCode((int)response.StatusCode, responseBody),
@@ -878,7 +972,7 @@ public class HikVisionIsapiClient : IDisposable
         return ("success", $"{logLabel} succeeded", (int)response.StatusCode, responseBody);
     }
 
-    private static string BuildCallbackXml(string callbackUrl, int hostId)
+    private static string BuildCallbackXml(string callbackUrl, int hostId, string parameterFormatType)
     {
         var protocol = callbackUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase) ? "HTTPS" : "HTTP";
         var host = ExtractHost(callbackUrl);
@@ -890,10 +984,11 @@ public class HikVisionIsapiClient : IDisposable
   <id>{{hostId}}</id>
   <url>{{System.Security.SecurityElement.Escape(callbackUrl)}}</url>
   <protocolType>{{protocol}}</protocolType>
-  <parameterFormatType>XML</parameterFormatType>
+  <parameterFormatType>{{System.Security.SecurityElement.Escape(parameterFormatType)}}</parameterFormatType>
   <addressingFormatType>{{(System.Net.IPAddress.TryParse(host, out _) ? "ipaddress" : "hostname")}}</addressingFormatType>
   {{(System.Net.IPAddress.TryParse(host, out _) ? $"<ipAddress>{System.Security.SecurityElement.Escape(host)}</ipAddress>" : $"<hostName>{System.Security.SecurityElement.Escape(host)}</hostName>")}}
 <portNo>{{port}}</portNo>
+<userName></userName>
 <httpAuthenticationMethod>none</httpAuthenticationMethod>
   <SubscribeEvent>
     <eventMode>all</eventMode>

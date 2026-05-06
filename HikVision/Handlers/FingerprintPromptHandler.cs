@@ -14,8 +14,8 @@ public static class FingerprintPromptHandler
         HikVisionConfig config)
     {
         var logger = Log.ForContext(typeof(FingerprintPromptHandler));
-        var timeoutSeconds = request.TimeoutSeconds ?? config.TimeoutSeconds;
-        var includeDebug = request.IncludeDebug ?? config.IncludeDebugInResponses;
+        var timeoutSeconds = request.TimeoutSeconds ?? HikVision.Config.HikVisionDefaults.RequestTimeoutSeconds;
+        var includeDebug = request.IncludeDebug ?? config.Debug;
 
         try
         {

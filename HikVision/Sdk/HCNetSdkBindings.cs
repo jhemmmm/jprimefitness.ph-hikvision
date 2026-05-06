@@ -9,12 +9,64 @@ namespace HikVision.Sdk;
 public static class HCNetSdkBindings
 {
     private const string HCNetSdkDll = "HCNetSDK.dll";
+    private static bool _sdkSearchDirectoryConfigured;
+
+    static HCNetSdkBindings()
+    {
+        NativeLibrary.SetDllImportResolver(typeof(HCNetSdkBindings).Assembly, ResolveNativeLibrary);
+    }
 
     public const uint ACS_ABILITY = 0x801;
     public const uint CAPTURE_FINGERPRINT_INFO = 2504;
     public const uint NET_SDK_CALLBACK_TYPE_STATUS = 0;
     public const uint NET_SDK_CALLBACK_TYPE_PROGRESS = 1;
     public const uint NET_SDK_CALLBACK_TYPE_DATA = 2;
+
+    private static IntPtr ResolveNativeLibrary(string libraryName, System.Reflection.Assembly assembly, DllImportSearchPath? searchPath)
+    {
+        if (!string.Equals(libraryName, HCNetSdkDll, StringComparison.OrdinalIgnoreCase))
+        {
+            return IntPtr.Zero;
+        }
+
+        var candidates = new[]
+        {
+            Path.Combine(AppContext.BaseDirectory, "lib", HCNetSdkDll),
+            Path.Combine(AppContext.BaseDirectory, HCNetSdkDll)
+        };
+
+        foreach (var candidate in candidates)
+        {
+            if (!File.Exists(candidate))
+            {
+                continue;
+            }
+
+            ConfigureSdkSearchDirectory(candidate);
+            return NativeLibrary.Load(candidate);
+        }
+
+        return IntPtr.Zero;
+    }
+
+    private static void ConfigureSdkSearchDirectory(string sdkPath)
+    {
+        if (_sdkSearchDirectoryConfigured || !OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var sdkDirectory = Path.GetDirectoryName(sdkPath);
+        if (!string.IsNullOrWhiteSpace(sdkDirectory))
+        {
+            SetDllDirectory(sdkDirectory);
+        }
+
+        _sdkSearchDirectoryConfigured = true;
+    }
+
+    [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool SetDllDirectory(string? lpPathName);
 
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     public delegate void RemoteConfigCallback(

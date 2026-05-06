@@ -7,14 +7,19 @@ namespace HikVision.Services;
 
 public static class HelperPublicUrlResolver
 {
-    public static string? ResolveCallbackUrl(HikVisionConfig config, string callbackPath)
+    public static string? ResolveCallbackUrl(string? deviceIp)
     {
-        if (!Uri.TryCreate(config.BindUrl, UriKind.Absolute, out var bindUri))
+        return ResolveCallbackUrl(deviceIp, HikVisionDefaults.BindUrl, HikVisionDefaults.CallbackPath);
+    }
+
+    public static string? ResolveCallbackUrl(string? deviceIp, string bindUrl, string callbackPath)
+    {
+        if (!Uri.TryCreate(bindUrl, UriKind.Absolute, out var bindUri))
         {
             return null;
         }
 
-        var host = ResolvePublicHost(bindUri.Host, config.DeviceIp);
+        var host = ResolvePublicHost(bindUri.Host, deviceIp);
 
         if (string.IsNullOrWhiteSpace(host))
         {

@@ -1,4 +1,5 @@
 using System.Text;
+using HikVision.Config;
 using HikVision.Models;
 using HikVision.Services;
 using Serilog;
@@ -11,7 +12,8 @@ public static class AttendanceCallbackReceiveHandler
         HttpRequest request,
         AttendanceCallbackProbeService attendanceCallbackProbeService,
         AttendanceForwardService attendanceForwardService,
-        HikVision.Services.DeviceAutoConfigService deviceAutoConfigService)
+        DeviceAutoConfigService deviceAutoConfigService,
+        HikVisionConfig config)
     {
         var logger = Log.ForContext(typeof(AttendanceCallbackReceiveHandler));
 
@@ -50,7 +52,7 @@ public static class AttendanceCallbackReceiveHandler
             snapshot.NormalizedEvent?.DeviceName);
 
         logger.Information(
-            "Received helper attendance callback #{CallbackCount} from {RemoteIpAddress} {Method} {Path}{QueryString} employee={EmployeeNo} serial={SerialNo} forwardStatus={ForwardStatus} body={Body}",
+            "Received helper attendance callback #{CallbackCount} from {RemoteIpAddress} {Method} {Path}{QueryString} employee={EmployeeNo} serial={SerialNo} forwardStatus={ForwardStatus}",
             snapshot.CallbackCount,
             snapshot.RemoteIpAddress ?? "unknown",
             snapshot.Method,
@@ -58,13 +60,17 @@ public static class AttendanceCallbackReceiveHandler
             snapshot.QueryString ?? string.Empty,
             snapshot.NormalizedEvent?.EmployeeNo ?? string.Empty,
             snapshot.NormalizedEvent?.EventSerialNo,
-            snapshot.ForwardResult?.Status ?? "skipped",
+            snapshot.ForwardResult?.Status ?? "skipped");
+
+        logger.Debug(
+            "Attendance callback #{CallbackCount} body={Body}",
+            snapshot.CallbackCount,
             string.IsNullOrWhiteSpace(snapshot.Body) ? "<empty>" : snapshot.Body);
 
         return Results.Json(new AttendanceCallbackReceiveResponse
         {
             CallbackCount = snapshot.CallbackCount,
-            Callback = snapshot
+            Callback = config.Debug ? snapshot : null
         });
     }
 }

@@ -9,13 +9,15 @@ namespace HikVision.Services;
 public class HikVisionSdkClient : IDisposable
 {
     private readonly HikVisionConfig _config;
+    private readonly HikVisionDeviceState _deviceState;
     private static readonly RemoteConfigCallback RemoteConfigCallbackInstance = HandleRemoteConfigCallback;
     private int _loginId = -1;
     private bool _initialized;
 
-    public HikVisionSdkClient(HikVisionConfig config)
+    public HikVisionSdkClient(HikVisionConfig config, HikVisionDeviceState deviceState)
     {
         _config = config;
+        _deviceState = deviceState;
     }
 
     public void Initialize()
@@ -59,7 +61,9 @@ public class HikVisionSdkClient : IDisposable
 
         try
         {
-            Log.Information("Attempting SDK login to {DeviceIp}:{Port}", _config.DeviceIp, _config.SdkPort);
+            var deviceIp = _deviceState.RequireDeviceIp();
+
+            Log.Information("Attempting SDK login to {DeviceIp}:{Port}", deviceIp, HikVisionDefaults.SdkPort);
 
             var loginInfo = new NET_DVR_USER_LOGIN_INFO
             {
@@ -68,7 +72,7 @@ public class HikVisionSdkClient : IDisposable
                 sPassword = new byte[64],
                 byRes3 = new byte[119],
                 byUseTransport = 0,
-                wPort = (ushort)_config.SdkPort,
+                wPort = HikVisionDefaults.SdkPort,
                 cbLoginResult = IntPtr.Zero,
                 pUser = IntPtr.Zero,
                 bUseAsynLogin = 0,
@@ -80,7 +84,7 @@ public class HikVisionSdkClient : IDisposable
                 byVerifyMode = 0
             };
 
-            SetString(loginInfo.sDeviceAddress, _config.DeviceIp);
+            SetString(loginInfo.sDeviceAddress, deviceIp);
             SetString(loginInfo.sUserName, _config.Username);
             SetString(loginInfo.sPassword, _config.Password);
 
@@ -105,7 +109,7 @@ public class HikVisionSdkClient : IDisposable
         catch (DllNotFoundException ex)
         {
             Log.Error(ex, "HCNetSDK.dll was not found");
-            return (false, 0, "HCNetSDK.dll not found. Copy the Hikvision Windows SDK DLLs next to the executable or add them to PATH.");
+            return (false, 0, "HCNetSDK.dll not found. Put the Hikvision Windows SDK DLLs in the executable folder's lib directory, next to lib/HCNetSDK.dll, or add them to PATH.");
         }
         catch (BadImageFormatException ex)
         {
@@ -219,7 +223,7 @@ public class HikVisionSdkClient : IDisposable
 
             var condSize = Marshal.SizeOf<NET_DVR_CAPTURE_FINGERPRINT_COND>();
             var condPtr = Marshal.AllocHGlobal(condSize);
-            var callbackContext = new RemoteConfigCallbackContext(_config.EnableVerboseSdkTracing);
+            var callbackContext = new RemoteConfigCallbackContext(_config.Debug);
             callbackHandle = GCHandle.Alloc(callbackContext);
 
             try

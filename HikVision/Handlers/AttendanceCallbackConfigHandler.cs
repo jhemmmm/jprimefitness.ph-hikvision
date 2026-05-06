@@ -7,10 +7,10 @@ namespace HikVision.Handlers;
 
 public static class AttendanceCallbackConfigHandler
 {
-    public static string? ResolveCallbackUrl(HikVisionConfig config, string? callbackUrl = null)
+    public static string? ResolveCallbackUrl(HikVisionDeviceState deviceState, string? callbackUrl = null)
     {
         var rawCallbackUrl = string.IsNullOrWhiteSpace(callbackUrl)
-            ? HelperPublicUrlResolver.ResolveCallbackUrl(config, config.CallbackPath)
+            ? HelperPublicUrlResolver.ResolveCallbackUrl(deviceState.DeviceIp)
             : callbackUrl;
 
         if (string.IsNullOrWhiteSpace(rawCallbackUrl))
@@ -18,16 +18,7 @@ public static class AttendanceCallbackConfigHandler
             return null;
         }
 
-        var resolvedCallbackUrl = NormalizeAbsoluteUrl(rawCallbackUrl);
-
-        if (string.IsNullOrWhiteSpace(config.CallbackToken))
-        {
-            return resolvedCallbackUrl;
-        }
-
-        var separator = resolvedCallbackUrl.Contains('?') ? "&" : "?";
-
-        return $"{resolvedCallbackUrl}{separator}token={Uri.EscapeDataString(config.CallbackToken)}";
+        return NormalizeAbsoluteUrl(rawCallbackUrl);
     }
 
     private static string NormalizeAbsoluteUrl(string callbackUrl)
@@ -45,10 +36,10 @@ public static class AttendanceCallbackConfigHandler
     public static async Task<AttendanceCallbackConfigResponse> Handle(
         AttendanceCallbackConfigRequest request,
         HikVisionIsapiClient hikVisionIsapiClient,
-        HikVisionConfig config)
+        HikVisionDeviceState deviceState)
     {
         var logger = Log.ForContext(typeof(AttendanceCallbackConfigHandler));
-        var callbackUrl = ResolveCallbackUrl(config, request.CallbackUrl);
+        var callbackUrl = ResolveCallbackUrl(deviceState, request.CallbackUrl);
 
         if (string.IsNullOrWhiteSpace(callbackUrl))
         {
@@ -65,6 +56,11 @@ public static class AttendanceCallbackConfigHandler
 
             var (status, message, httpStatusCode, _, hostId, rawResponse) =
                 await hikVisionIsapiClient.ConfigureAttendanceCallbackAsync(callbackUrl, request.HostId);
+
+            if (status == "success")
+            {
+                deviceState.SetCallbackUrl(callbackUrl);
+            }
 
             return new AttendanceCallbackConfigResponse
             {

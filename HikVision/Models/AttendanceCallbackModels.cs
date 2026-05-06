@@ -47,7 +47,8 @@ public class AttendanceForwardPayload
     public int? DoorNo { get; set; }
     public string? UserType { get; set; }
     public string? AttendanceStatus { get; set; }
-    public System.Text.Json.JsonElement Raw { get; set; }
+    public System.Text.Json.JsonElement? Raw { get; set; }
+    public string? RawBody { get; set; }
 }
 
 public class AttendanceForwardResult

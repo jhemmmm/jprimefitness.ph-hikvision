@@ -13,7 +13,7 @@ public static class IsapiFingerprintSetupHandler
         HikVisionConfig config)
     {
         var logger = Log.ForContext(typeof(IsapiFingerprintSetupHandler));
-        var timeoutSeconds = request.TimeoutSeconds ?? config.TimeoutSeconds;
+        var timeoutSeconds = request.TimeoutSeconds ?? HikVision.Config.HikVisionDefaults.RequestTimeoutSeconds;
 
         try
         {

@@ -1,282 +1,147 @@
-# Hikvision Remote Fingerprint Proof Helper
 # HikVision Helper
 
-A Windows .NET 8 ASP.NET Core service that bridges a Hikvision access control terminal to a Laravel backend. It handles fingerprint enrollment, person management, attendance event search, and real-time attendance callbacks — using both the Hikvision HCNetSDK and the ISAPI HTTP REST interface.
+A Windows .NET 8 ASP.NET Core helper that connects a Hikvision access-control terminal to a web API.
+
+The helper:
+
+- discovers the Hikvision device on startup with SADP
+- registers `/attendance/callback` on the device automatically
+- receives real-time attendance callbacks
+- forwards attendance callbacks to the configured web API
+- keeps the existing SDK, fingerprint, person, and attendance search endpoints used by the web system
 
 ## Configuration
 
-Edit `appsettings.json`. Only `Username` and `Password` are required — everything else has a sensible default or is auto-detected at runtime.
+Only five values are configurable in `appsettings.json`:
 
 ```json
 {
   "HikVision": {
+    "ForwardUrl": "https://your-web-api.example/api/biometric/hikvision/callback",
+    "ForwardToken": "your-forward-token",
     "Username": "admin",
-    "Password": "your-password",
-
-    "DeviceIp": "",
-    "DeviceSerial": "",
-
-    "HttpPort": 80,
-    "SdkPort": 8000,
-    "TimeoutSeconds": 30,
-
-    "BindUrl": "http://0.0.0.0:5077",
-    "CallbackPath": "/attendance/callback",
-    "CallbackToken": "your-secret-token",
-    "CallbackHostId": 2,
-
-    "ForwardUrl": "http://your-laravel-app/hikvision/callback",
-    "ForwardToken": "your-laravel-token"
+    "Password": "your-device-password",
+    "Debug": false
   }
 }
 ```
 
-### Auto-detection
+All other helper settings are fixed internal defaults:
 
-`DeviceIp` and `DeviceSerial` do not need to be set manually:
-
-| Field | How it is resolved |
+| Setting | Value |
 |---|---|
-| `DeviceIp` | SADP UDP broadcast on startup → learned from the first incoming callback if SADP finds nothing |
-| `DeviceSerial` | Fetched from `/ISAPI/System/deviceInfo` once the IP is known → falls back to `deviceName` in the callback payload |
+| Helper bind URL | `http://0.0.0.0:5077` |
+| Device HTTP port | `80` |
+| Device SDK port | `8000` |
+| Callback path | `/attendance/callback` |
+| Callback host id | `2` |
+| Default request timeout | `30s` |
 
-Once the device is found, the attendance callback URL is automatically registered on the device.
+Startup fails if unsupported `HikVision` keys are present. This keeps deployment predictable: users configure only the web API forward target, token, device credentials, and debug mode.
+
+## Startup Behavior
+
+On startup, the helper:
+
+1. validates the five supported configuration keys
+2. discovers Hikvision devices with SADP
+3. requires exactly one discovered device
+4. stores the discovered IP in runtime state
+5. fetches device serial/model/firmware with ISAPI
+6. resolves the helper callback URL
+7. registers the attendance callback on the device
+8. starts listening on `http://0.0.0.0:5077`
+
+If no device is found, or multiple devices are found, the helper does not guess. It exits with a clear log message.
+
+## Forwarding
+
+Attendance callbacks received at `/attendance/callback` are normalized and forwarded to `ForwardUrl`.
+
+The forwarding request includes:
+
+```http
+Content-Type: application/json
+X-Biometric-Token: {ForwardToken}
+```
+
+The forwarded payload includes normalized attendance fields plus the raw Hikvision callback payload when available.
 
 ## Running
-
-### Prerequisites
-
-- Windows host on the same LAN as the Hikvision terminal
-- `HCNetSDK.dll` present in the application directory (required for SDK endpoints only)
-- .NET 8 runtime
-
-### Start
 
 ```bash
 dotnet run --project HikVision.csproj
 ```
 
-The helper listens on `http://0.0.0.0:5077` and writes rolling logs to `logs/hikvision-helper-<date>.txt`.
-
-### Running with Arguments
-
-Any setting from `appsettings.json` can be overridden at the command line without editing the file. Arguments take precedence over `appsettings.json`.
+Command-line overrides are available for the five supported settings:
 
 ```bash
-dotnet run --project HikVision.csproj -- [arguments]
+dotnet run --project HikVision.csproj -- --username admin --password secret --forward-url https://your-web-api.example/api/biometric/hikvision/callback --forward-token token --debug false
 ```
 
-> Note the `--` separator between `dotnet run` options and the application arguments.
+## Release Build
 
-#### All available arguments
-
-| Argument | Short | Config key | Default |
-|---|---|---|---|
-| `--ip` | | `DeviceIp` | *(auto-detected)* |
-| `--serial` | | `DeviceSerial` | *(auto-detected)* |
-| `--username` | `-u` | `Username` | *(required)* |
-| `--password` | `-p` | `Password` | *(required)* |
-| `--http-port` | | `HttpPort` | `80` |
-| `--sdk-port` | | `SdkPort` | `8000` |
-| `--timeout` | | `TimeoutSeconds` | `30` |
-| `--bind` | | `BindUrl` | `http://0.0.0.0:5077` |
-| `--callback-path` | | `CallbackPath` | `/attendance/callback` |
-| `--callback-token` | | `CallbackToken` | *(none)* |
-| `--callback-host-id` | | `CallbackHostId` | `2` |
-| `--forward-url` | | `ForwardUrl` | *(none)* |
-| `--forward-token` | | `ForwardToken` | *(none)* |
-
-#### Examples
-
-Minimal — just supply credentials and let the device be auto-discovered:
 ```bash
-dotnet run --project HikVision.csproj -- -u admin -p secret
+dotnet build HikVision.sln -c Release
 ```
 
-Point at a specific device and forward events to Laravel:
-```bash
-dotnet run --project HikVision.csproj -- --ip 192.168.250.201 -u admin -p secret --forward-url http://laravel.local/hikvision/callback --forward-token abc123
+The application release output is written to the repository-level `bin` folder:
+
+```text
+bin/
+  HikVision.exe
+  HikVision.dll
+  appsettings.json
+  lib/
+    HCNetSDK.dll
 ```
 
-Change the port the helper listens on:
-```bash
-dotnet run --project HikVision.csproj -- --bind http://0.0.0.0:9000
-```
-
-Run the published binary directly (no `dotnet run` wrapper):
-```bash
-HikVision.exe --ip 192.168.250.201 -u admin -p secret
-```
+The SDK loader checks `lib/HCNetSDK.dll` relative to the executable before falling back to the normal Windows DLL search path.
 
 ## API Endpoints
 
-### `GET /health`
+### Health
 
-```json
-{ "status": "healthy", "timestamp": "..." }
-```
+- `GET /health`
 
----
+### SDK
 
-### SDK Endpoints
+- `POST /sdk/test-login`
+- `GET /sdk/acs-ability`
 
-#### `POST /sdk/test-login`
+### Fingerprint
 
-Verifies the HCNetSDK can authenticate to the device.
+- `POST /fingerprint/enroll`
+- `POST /fingerprint/delete`
+- `POST /isapi/fingerprint/delete`
+- `POST /isapi/fingerprint/setup`
 
-```json
-{ "status": "success", "message": "Login successful", "sdkErrorCode": 0 }
-```
+### Person
 
-#### `GET /sdk/acs-ability`
+- `POST /persons/upsert`
+- `POST /persons/search`
+- `POST /persons/delete`
 
-Returns the access control capabilities reported by the SDK.
+### Attendance
 
----
-
-### Fingerprint Endpoints
-
-#### `POST /fingerprint/enroll`
-
-Triggers a remote fingerprint prompt on the terminal via the HCNetSDK and waits for the finger to be placed.
-
-**Request:**
-```json
-{ "employeeNo": "00000001", "fingerprintId": 1, "timeoutSeconds": 30 }
-```
-
-**Response statuses:** `success` · `unsupported` · `failed` · `timeout`
-
-#### `POST /fingerprint/delete` · `POST /isapi/fingerprint/delete`
-
-Deletes a stored fingerprint for an employee.
-
-**Request:**
-```json
-{ "employeeNo": "00000001", "fingerprintId": 1 }
-```
-
-#### `POST /isapi/fingerprint/setup`
-
-Starts a fingerprint capture session via ISAPI (alternative to SDK-based enroll).
-
----
-
-### Person Endpoints
-
-#### `POST /persons/upsert`
-
-Creates or updates a person record on the device.
-
-**Request:**
-```json
-{
-  "employeeNo": "00000001",
-  "name": "Jane Smith",
-  "userType": "normal",
-  "validityEnabled": false
-}
-```
-
-#### `POST /persons/search`
-
-Looks up a person by employee number.
-
-**Request:**
-```json
-{ "employeeNo": "00000001" }
-```
-
-#### `POST /persons/delete`
-
-Removes a person and their associated data from the device.
-
-**Request:**
-```json
-{ "employeeNo": "00000001" }
-```
-
----
-
-### Attendance Endpoints
-
-#### `POST /attendance/search`
-
-Queries stored attendance events on the device.
-
-**Request:**
-```json
-{
-  "startTime": "2026-01-01T00:00:00",
-  "endTime": "2026-12-31T23:59:59",
-  "employeeNo": "00000001",
-  "maxResults": 30
-}
-```
-
-#### `POST /attendance/callback`
-
-Receives real-time attendance events pushed by the device. The device posts here automatically once the callback URL has been registered. Received events are optionally forwarded to `ForwardUrl`.
-
-#### `GET /attendance/callback/last`
-
-Returns the most recently received callback payload.
-
-#### `POST /attendance/callback/configure`
-
-Manually re-registers the callback URL on the device.
-
-**Request:**
-```json
-{ "callbackUrl": "http://192.168.250.102:5077/attendance/callback" }
-```
-
----
-
-## Architecture
-
-```
-HikVision terminal
-  │  ISAPI HTTP (port 80)  ──→  HikVisionIsapiClient
-  │  HCNetSDK (port 8000)  ──→  HikVisionSdkClient
-  └─ Attendance callback   ──→  AttendanceCallbackReceiveHandler
-                                  └─ AttendanceForwardService ──→ Laravel
-```
-
-| Component | Location |
-|---|---|
-| Configuration | `Config/HikVisionConfig.cs` |
-| ISAPI client | `Services/HikVisionIsapiClient.cs` |
-| SDK client | `Services/HikVisionSdkClient.cs` |
-| SDK PInvoke bindings | `Sdk/HCNetSdkBindings.cs` |
-| Device auto-discovery | `Services/HikVisionDeviceDiscovery.cs` (SADP) |
-| Device auto-config | `Services/DeviceAutoConfigService.cs` (learns from first callback) |
-| Endpoint handlers | `Handlers/` |
-| Startup wiring | `Program.cs` |
+- `POST /attendance/search`
+- `POST /attendance/callback`
+- `GET /attendance/callback/last`
+- `POST /attendance/callback/configure`
 
 ## Troubleshooting
 
 | Symptom | Check |
 |---|---|
-| `DllNotFoundException` on SDK endpoints | Copy `HCNetSDK.dll` to the application directory |
-| Device not found at startup | Ensure the machine is on the same LAN; set `DeviceIp` manually if SADP is disabled on the device |
-| `/sdk/test-login` fails | Verify `Username`, `Password`, `DeviceIp`, and that port 8000 is reachable |
-| `/fingerprint/enroll` returns `unsupported` | This terminal model may not support remote capture via SDK; use `/isapi/fingerprint/setup` instead |
-| No attendance callbacks arriving | Check `CallbackToken` matches what the device was configured with; trigger `POST /attendance/callback/configure` to re-register |
-| Helper won't start | Verify .NET 8 runtime is installed; check `logs/` for startup errors |
-## Next Steps (Phase 2+)
+| Startup says no device found | Confirm the helper machine is on the same LAN and UDP port `37020` is reachable. |
+| Startup says multiple devices found | Keep only one Hikvision device reachable from this helper instance. |
+| Forwarding is rejected by the web API | Confirm `ForwardToken` matches what the API expects in `X-Biometric-Token`. |
+| SDK endpoints fail with DLL errors | Confirm the Hikvision SDK DLLs are in `bin/lib`, including `bin/lib/HCNetSDK.dll`, or add them to `PATH`. |
+| No attendance callbacks arrive | Check logs for callback registration status and confirm the helper URL is reachable from the device. |
 
-1. Once this proof confirms capability or limitation, file decision in the project
-2. If successful, create `HikVisionProofHelperBridge.cs` in the Laravel codebase
-3. Add `/api/biometric/fingerprint-remote` endpoint to Laravel that:
-   - Calls POST `/fingerprint/prompt` on the Windows helper
-   - Returns structured result to the frontend
-4. Update UI to show a "Waiting for fingerprint..." modal during capture
-5. Integrate with the existing biometric enrollment flow
+## Verification
 
----
-
-**Phase 1 Outcome**: Proof-of-capability ✅  
-**Success Criteria**: Decisive answer to "does the terminal support remote prompts?"  
-**Deployment**: Local Windows machine, not production  
-**Integration**: Intentionally decoupled from Laravel until phase 2
+```bash
+dotnet build
+dotnet test
+```

@@ -1,47 +1,36 @@
-using HikVision.Config;
 using Serilog;
 
 namespace HikVision.Services;
 
 /// <summary>
-/// Learns the device IP and serial number from the first incoming attendance callback
-/// when they could not be determined at startup (e.g. SADP discovery found nothing).
-/// Once the IP is known the ISAPI client base address is updated and the callback
-/// URL is re-registered on the device so future operations work immediately.
+/// Diagnostic fallback that can learn the device IP from a callback if startup discovery
+/// was bypassed or the service is reused in tests. Normal startup discovery should make
+/// this a no-op in production.
 /// </summary>
 public class DeviceAutoConfigService
 {
-    private readonly HikVisionConfig _config;
+    private readonly HikVisionDeviceState _deviceState;
     private readonly HikVisionIsapiClient _isapiClient;
-    private int _configured; // 0 = pending, 1 = done (interlocked)
+    private int _configured; // 0 = pending, 1 = done
 
-    public DeviceAutoConfigService(HikVisionConfig config, HikVisionIsapiClient isapiClient)
+    public DeviceAutoConfigService(HikVisionDeviceState deviceState, HikVisionIsapiClient isapiClient)
     {
-        _config = config;
+        _deviceState = deviceState;
         _isapiClient = isapiClient;
     }
 
-    /// <summary>
-    /// Call on every received callback. No-op once the device is already configured.
-    /// Runs the heavy work on a background thread so it never delays the callback response.
-    /// </summary>
     public void TryLearnFromCallback(string? deviceIpFromPayload, string? deviceNameFromPayload)
     {
-        // Fast-path: already configured
-        if (!string.IsNullOrWhiteSpace(_config.DeviceIp))
+        if (_deviceState.IsReady)
             return;
 
-        // Only one goroutine should do the configuration work
         if (Interlocked.CompareExchange(ref _configured, 1, 0) != 0)
             return;
 
-        var ip = deviceIpFromPayload;
-        var serial = deviceNameFromPayload;
-
-        if (string.IsNullOrWhiteSpace(ip))
+        if (string.IsNullOrWhiteSpace(deviceIpFromPayload))
         {
-            Log.Warning("DeviceAutoConfig: Callback received but no ipAddress in payload — cannot auto-configure.");
-            Interlocked.Exchange(ref _configured, 0); // allow retry on next callback
+            Log.Warning("DeviceAutoConfig: Callback received but no ipAddress was present in the payload.");
+            Interlocked.Exchange(ref _configured, 0);
             return;
         }
 
@@ -49,40 +38,20 @@ public class DeviceAutoConfigService
         {
             try
             {
-                Log.Information("DeviceAutoConfig: Learned device IP {IP} from first callback. Configuring...", ip);
-                _config.DeviceIp = ip;
+                Log.Information("DeviceAutoConfig: Learned device IP {IP} from callback. Configuring runtime state...", deviceIpFromPayload);
+                _deviceState.SetDiscoveredDevice(deviceIpFromPayload, deviceNameFromPayload, deviceType: null);
 
-                // Prefer the real serial from ISAPI over the deviceName field
                 var (success, fetchedSerial, deviceType, firmware) = await _isapiClient.GetDeviceInfoAsync();
-                if (success && !string.IsNullOrWhiteSpace(fetchedSerial))
+                if (success)
                 {
-                    _config.DeviceSerial = fetchedSerial;
-                    Log.Information(
-                        "DeviceAutoConfig: Serial={Serial}, Type={Type}, Firmware={Firmware}",
-                        fetchedSerial, deviceType, firmware);
-                }
-                else if (!string.IsNullOrWhiteSpace(serial))
-                {
-                    _config.DeviceSerial = serial;
-                    Log.Information("DeviceAutoConfig: Using deviceName as serial: {Serial}", serial);
-                }
-                else
-                {
-                    Log.Warning("DeviceAutoConfig: Could not determine device serial number.");
+                    _deviceState.SetDeviceInfo(fetchedSerial, deviceType, firmware);
                 }
 
-                Log.Information(
-                    "DeviceAutoConfig: Device configured — IP: {IP}, Serial: {Serial}",
-                    _config.DeviceIp, _config.DeviceSerial);
-
-                // Re-register the callback on the device now that we have its IP
                 await ReRegisterCallbackAsync();
             }
             catch (Exception ex)
             {
-                Log.Warning(ex, "DeviceAutoConfig: Failed to complete auto-configuration from callback");
-                // Reset so next callback can retry
-                _config.DeviceIp = null;
+                Log.Warning(ex, "DeviceAutoConfig: Failed to complete fallback auto-configuration from callback");
                 Interlocked.Exchange(ref _configured, 0);
             }
         });
@@ -90,28 +59,25 @@ public class DeviceAutoConfigService
 
     private async Task ReRegisterCallbackAsync()
     {
-        try
+        var callbackUrl = Handlers.AttendanceCallbackConfigHandler.ResolveCallbackUrl(_deviceState);
+        if (string.IsNullOrWhiteSpace(callbackUrl))
         {
-            var callbackUrl = Handlers.AttendanceCallbackConfigHandler.ResolveCallbackUrl(_config);
-
-            if (string.IsNullOrWhiteSpace(callbackUrl))
-            {
-                Log.Warning("DeviceAutoConfig: Could not resolve callback URL for re-registration.");
-                return;
-            }
-
-            Log.Information("DeviceAutoConfig: Re-registering attendance callback to {CallbackUrl}", callbackUrl);
-
-            var (status, message, httpStatusCode, _, _, _) =
-                await _isapiClient.ConfigureAttendanceCallbackAsync(callbackUrl, _config.CallbackHostId);
-
-            Log.Information(
-                "DeviceAutoConfig: Callback re-registration result: status={Status}, httpStatusCode={HttpStatusCode}, message={Message}",
-                status, httpStatusCode, message);
+            Log.Warning("DeviceAutoConfig: Could not resolve callback URL for re-registration.");
+            return;
         }
-        catch (Exception ex)
+
+        Log.Information("DeviceAutoConfig: Re-registering attendance callback to {CallbackUrl}", callbackUrl);
+
+        var (status, message, httpStatusCode, _, _, _) =
+            await _isapiClient.ConfigureAttendanceCallbackAsync(callbackUrl, Config.HikVisionDefaults.CallbackHostId);
+
+        if (status == "success")
         {
-            Log.Warning(ex, "DeviceAutoConfig: Failed to re-register attendance callback");
+            _deviceState.SetCallbackUrl(callbackUrl);
         }
+
+        Log.Information(
+            "DeviceAutoConfig: Callback re-registration result: status={Status}, httpStatusCode={HttpStatusCode}, message={Message}",
+            status, httpStatusCode, message);
     }
 }
