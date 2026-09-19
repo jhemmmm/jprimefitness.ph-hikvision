@@ -7,6 +7,7 @@ public class HealthResponse
     public string Version { get; set; } = "1.0.0-helper";
     public bool DeviceReady { get; set; }
     public string? DeviceIp { get; set; }
+    public string? DeviceMac { get; set; }
     public string? DeviceSerial { get; set; }
     public string? DeviceType { get; set; }
     public string? FirmwareVersion { get; set; }

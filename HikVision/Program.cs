@@ -1,3 +1,4 @@
+using System.Net;
 using Serilog;
 using Serilog.Events;
 using HikVision.Config;
@@ -37,6 +38,11 @@ try
 
     Log.Information("Hikvision Helper starting on {BindUrl}", HikVisionDefaults.BindUrl);
     await app.RunAsync(HikVisionDefaults.BindUrl);
+}
+catch (HikVision.Services.DeviceSetupException ex)
+{
+    Log.Fatal("Cannot start the helper. {Guidance}", ex.Message);
+    Environment.ExitCode = 1;
 }
 catch (Exception ex)
 {
@@ -134,6 +140,18 @@ static void MapEndpoints(WebApplication app)
     app.MapPost("/attendance/callback/configure", AttendanceCallbackConfigHandler.Handle)
         .WithName("Attendance Callback Configure")
         .Produces<AttendanceCallbackConfigResponse>();
+
+    app.MapGet("/sadp/devices", SadpDevicesHandler.Handle)
+        .WithName("SADP Devices")
+        .Produces<SadpDevicesResponse>();
+
+    app.MapPost("/sadp/modify", SadpModifyHandler.Handle)
+        .WithName("SADP Modify Network")
+        .Produces<SadpModifyResponse>();
+
+    app.MapPost("/device/network", DeviceNetworkHandler.Handle)
+        .WithName("Device Network Configure")
+        .Produces<DeviceNetworkResponse>();
 }
 
 static async Task InitializeDeviceAsync(IServiceProvider services)
@@ -143,14 +161,14 @@ static async Task InitializeDeviceAsync(IServiceProvider services)
     var isapiClient = services.GetRequiredService<HikVisionIsapiClient>();
 
     Log.Information("Discovering Hikvision device with SADP...");
-    var discovered = await HikVisionDeviceDiscovery.DiscoverRequiredSingleDeviceAsync(
-        config.Username,
-        config.Password);
-    deviceState.SetDiscoveredDevice(discovered.IpAddress, discovered.SerialNumber, discovered.DeviceType);
+    var discovered = await HikVisionDeviceDiscovery.DiscoverRequiredSingleDeviceAsync(attempts: 2);
+    discovered = await EnsureDeviceOnLocalSubnetAsync(discovered, config);
+    deviceState.SetDiscoveredDevice(discovered.IpAddress, discovered.SerialNumber, discovered.DeviceType, discovered.MacAddress, discovered.Encrypt);
 
     Log.Information(
-        "Discovery: Using Hikvision device IP {IP}, serial={Serial}, type={Type}",
+        "Discovery: Using Hikvision device IP {IP}, mac={Mac}, serial={Serial}, type={Type}",
         discovered.IpAddress,
+        discovered.MacAddress,
         discovered.SerialNumber,
         discovered.DeviceType);
 
@@ -189,4 +207,103 @@ static async Task InitializeDeviceAsync(IServiceProvider services)
             httpStatusCode,
             message);
     }
+}
+
+/// <summary>
+/// The helper can only talk ISAPI/SDK to a device it can route to. When SADP finds the device on a foreign subnet
+/// (e.g. it kept a static IP from an old router), move it into the helper's subnet with a SADP network update,
+/// exactly like "Modify Network Parameters" in the official SADP tool, then continue with the new address.
+/// </summary>
+static async Task<HikVisionDeviceDiscovery.DiscoveredDevice> EnsureDeviceOnLocalSubnetAsync(
+    HikVisionDeviceDiscovery.DiscoveredDevice discovered,
+    HikVisionConfig config)
+{
+    // Enumerate the local interfaces once and reuse the list for the subnet check, the plan, and logging.
+    var interfaces = LocalNetwork.GetIpv4Interfaces(includeVirtualInterfaces: false);
+    var subnets = interfaces
+        .Select(i => (Network: LocalNetwork.ToUInt32(i.Address) & LocalNetwork.ToUInt32(i.Mask), Mask: LocalNetwork.ToUInt32(i.Mask)))
+        .Distinct()
+        .ToList();
+
+    if (IPAddress.TryParse(discovered.IpAddress, out var discoveredAddress)
+        && LocalNetwork.IsInAnyLocalSubnet(discoveredAddress, subnets))
+    {
+        return discovered;
+    }
+
+    var localSubnets = string.Join(", ", interfaces.Select(i => $"{i.Address}/{i.Mask} ({i.Name})"));
+
+    Log.Warning(
+        "SADP: Device {IP}/{Mask} gw {Gateway} is not in any local subnet [{LocalSubnets}]. The helper cannot reach it by IP.",
+        discovered.IpAddress,
+        discovered.SubnetMask ?? "?",
+        discovered.Gateway ?? "?",
+        localSubnets);
+
+    var httpPort = discovered.HttpPort ?? HikVisionDefaults.HttpPort;
+    if (discoveredAddress is not null
+        && await LocalNetwork.IsTcpPortOpenAsync(discoveredAddress, httpPort, timeoutMs: 1500))
+    {
+        Log.Warning("SADP: Device {IP}:{Port} is reachable through routing anyway; skipping the automatic network fix.", discovered.IpAddress, httpPort);
+        return discovered;
+    }
+
+    if (SadpProtocol.NormalizeMac(discovered.MacAddress) is null)
+    {
+        throw new HikVision.Services.DeviceSetupException(
+            $"Device {discovered.IpAddress} is on another subnet and reported no MAC address, so its network settings cannot be changed automatically. " +
+            "Use the Hikvision SADP tool to move it into the helper's subnet, then restart the helper.");
+    }
+
+    var plan = SadpNetworkPlanner.PlanOffSubnetFix(
+        discovered,
+        interfaces,
+        ip => LocalNetwork.IsHostRespondingAsync(ip, 500).GetAwaiter().GetResult());
+
+    if (plan is null)
+    {
+        throw new HikVision.Services.DeviceSetupException(
+            $"Device {discovered.IpAddress} is on another subnet and no free address could be chosen in the helper's subnet [{localSubnets}]. " +
+            "Use the Hikvision SADP tool to move it into the helper's subnet, then restart the helper.");
+    }
+
+    // Encrypt=true firmware rejects a plain-text SADP password and locks itself after repeated failed attempts, so do
+    // not send a doomed update on every startup — show the manual-fix guidance straight away.
+    if (string.Equals(discovered.Encrypt, "true", StringComparison.OrdinalIgnoreCase))
+    {
+        throw new HikVision.Services.DeviceSetupException(
+            HikVisionSadpClient.BuildManualFixGuidance(HikVisionSadpClient.EncryptedPasswordReason, plan.Mac, plan));
+    }
+
+    var iface = SadpNetworkPlanner.SelectInterface(discovered, interfaces);
+    Log.Warning(
+        "SADP AUTO-FIX: Changing device {Mac} from {OldIp} to {NewIp}/{Mask} gw {Gateway} (cmd {CommandPort}, http {HttpPort}) via {Interface}",
+        plan.Mac,
+        discovered.IpAddress,
+        plan.IpAddress,
+        plan.SubnetMask,
+        plan.Gateway,
+        plan.CommandPort,
+        plan.HttpPort,
+        iface?.Name ?? "?");
+
+    var result = await HikVisionSadpClient.ModifyNetworkAndConfirmAsync(plan, config.Password);
+
+    if (!result.Success)
+    {
+        throw new HikVision.Services.DeviceSetupException(HikVisionSadpClient.BuildManualFixGuidance(result, plan));
+    }
+
+    Log.Warning(
+        "SADP AUTO-FIX: Device {Mac} is now at {NewIp} ({Detail})",
+        plan.Mac,
+        plan.IpAddress,
+        result.Confirmed is not null ? "confirmed by re-discovery" : result.Result);
+
+    return result.Confirmed ?? discovered with
+    {
+        IpAddress = plan.IpAddress,
+        SubnetMask = plan.SubnetMask,
+        Gateway = plan.Gateway
+    };
 }

@@ -567,6 +567,88 @@ public class HikVisionIsapiClient : IDisposable
         }
     }
 
+    /// <summary>
+    /// Changes the device's IPv4 network settings over ISAPI (Digest auth, plain-text password — no SADP encryption
+    /// needed). The device must currently be reachable by IP. <paramref name="mode"/> is "dhcp" or "static".
+    /// A dropped connection right after the PUT is treated as "likely applied", because the device switches to its new
+    /// address (or subnet) mid-response; callers should re-discover by MAC to confirm.
+    /// </summary>
+    public async Task<(string Status, string Message, int HttpStatusCode, string? RawResponse)> SetNetworkAsync(
+        string mode,
+        string? ipAddress = null,
+        string? subnetMask = null,
+        string? gateway = null,
+        string? primaryDns = null,
+        string? secondaryDns = null)
+    {
+        const string path = "/ISAPI/System/Network/interfaces/1/ipAddress";
+        var isDhcp = string.Equals(mode, "dhcp", StringComparison.OrdinalIgnoreCase);
+
+        if (!isDhcp && (ipAddress is null || subnetMask is null || gateway is null))
+        {
+            return ("failed", "ipAddress, subnetMask and gateway are required for a static network change.", 0, null);
+        }
+
+        // Read the current config first. A failure here means the device is NOT reachable, which must be reported as a
+        // failure — it is only the PUT that may legitimately drop the connection (the device moves mid-response).
+        string currentXml;
+        try
+        {
+            var getResponse = await _httpClient.GetAsync(DeviceUrl(path));
+            currentXml = await getResponse.Content.ReadAsStringAsync();
+            if (!getResponse.IsSuccessStatusCode)
+            {
+                return (
+                    MapHttpStatusToStatusCode((int)getResponse.StatusCode, currentXml),
+                    $"Could not read current network settings. HTTP {getResponse.StatusCode}.",
+                    (int)getResponse.StatusCode,
+                    currentXml);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "ISAPI: Could not read current network settings before the change");
+            return ("failed", $"Could not reach the device to read its current network settings: {ex.Message}", 0, null);
+        }
+
+        var body = isDhcp
+            ? IsapiNetworkXml.ToDynamic(currentXml)
+            : IsapiNetworkXml.ToStatic(currentXml, ipAddress!, subnetMask!, gateway!, primaryDns, secondaryDns);
+
+        Log.Information("ISAPI: Setting network to {Mode} (ip={Ip} mask={Mask} gw={Gateway})", mode, ipAddress ?? "-", subnetMask ?? "-", gateway ?? "-");
+        Log.Debug("ISAPI: Network PUT body={Body}", body);
+
+        try
+        {
+            var putResponse = await _httpClient.PutAsync(
+                DeviceUrl(path),
+                new StringContent(body, System.Text.Encoding.UTF8, "application/xml"));
+
+            var responseBody = await putResponse.Content.ReadAsStringAsync();
+            if (putResponse.IsSuccessStatusCode)
+            {
+                return ("success", "Network settings applied. The device may change its IP; re-discover by MAC to confirm.", (int)putResponse.StatusCode, responseBody);
+            }
+
+            return (
+                MapHttpStatusToStatusCode((int)putResponse.StatusCode, responseBody),
+                $"Network change was rejected. HTTP {putResponse.StatusCode}. Response: {responseBody}",
+                (int)putResponse.StatusCode,
+                responseBody);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+        {
+            // The device applied the change and dropped the connection because its address/subnet moved.
+            Log.Warning(ex, "ISAPI: Connection dropped during network change; this is expected when the device's IP moves.");
+            return ("applied", "The network change was sent and the device connection dropped, which is expected when its IP changes. Re-discover by MAC to confirm.", 0, null);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "ISAPI: Unexpected error during network change");
+            return ("failed", $"Unexpected error: {ex.Message}", 0, null);
+        }
+    }
+
     public async Task<(string Status, string Message, int HttpStatusCode, string? CallbackUrl, int HostId, string? RawResponse)> ConfigureAttendanceCallbackAsync(string callbackUrl, int? hostId)
     {
         try

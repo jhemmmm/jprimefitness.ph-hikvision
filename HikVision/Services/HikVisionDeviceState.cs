@@ -5,14 +5,18 @@ public sealed class HikVisionDeviceState
     private readonly object _sync = new();
 
     public string? DeviceIp { get; private set; }
+    public string? DeviceMac { get; private set; }
     public string? DeviceSerial { get; private set; }
     public string? DeviceType { get; private set; }
     public string? FirmwareVersion { get; private set; }
     public string? CallbackUrl { get; private set; }
 
+    /// <summary>The device's SADP Encrypt flag ("true" when it requires the encrypted-password format).</summary>
+    public string? DeviceEncrypt { get; private set; }
+
     public bool IsReady => !string.IsNullOrWhiteSpace(DeviceIp);
 
-    public void SetDiscoveredDevice(string deviceIp, string? serialNumber, string? deviceType)
+    public void SetDiscoveredDevice(string deviceIp, string? serialNumber, string? deviceType, string? macAddress = null, string? encrypt = null)
     {
         if (string.IsNullOrWhiteSpace(deviceIp))
             throw new ArgumentException("Device IP is required.", nameof(deviceIp));
@@ -20,8 +24,22 @@ public sealed class HikVisionDeviceState
         lock (_sync)
         {
             DeviceIp = deviceIp.Trim();
+            DeviceMac = string.IsNullOrWhiteSpace(macAddress) ? DeviceMac : macAddress.Trim();
             DeviceSerial = string.IsNullOrWhiteSpace(serialNumber) ? DeviceSerial : serialNumber.Trim();
             DeviceType = string.IsNullOrWhiteSpace(deviceType) ? DeviceType : deviceType.Trim();
+            DeviceEncrypt = string.IsNullOrWhiteSpace(encrypt) ? DeviceEncrypt : encrypt.Trim();
+        }
+    }
+
+    /// <summary>Points the helper at a new device IP after a SADP network update; other device data is kept.</summary>
+    public void SetDeviceIp(string deviceIp)
+    {
+        if (string.IsNullOrWhiteSpace(deviceIp))
+            throw new ArgumentException("Device IP is required.", nameof(deviceIp));
+
+        lock (_sync)
+        {
+            DeviceIp = deviceIp.Trim();
         }
     }
 
@@ -65,10 +83,12 @@ public sealed class HikVisionDeviceState
             return new HikVisionDeviceSnapshot(
                 IsReady,
                 DeviceIp,
+                DeviceMac,
                 DeviceSerial,
                 DeviceType,
                 FirmwareVersion,
-                CallbackUrl);
+                CallbackUrl,
+                DeviceEncrypt);
         }
     }
 }
@@ -76,7 +96,9 @@ public sealed class HikVisionDeviceState
 public sealed record HikVisionDeviceSnapshot(
     bool IsReady,
     string? DeviceIp,
+    string? DeviceMac,
     string? DeviceSerial,
     string? DeviceType,
     string? FirmwareVersion,
-    string? CallbackUrl);
+    string? CallbackUrl,
+    string? DeviceEncrypt);

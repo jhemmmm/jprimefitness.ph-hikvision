@@ -14,6 +14,7 @@ public static class HealthHandler
         {
             DeviceReady = snapshot.IsReady,
             DeviceIp = config.Debug ? snapshot.DeviceIp : null,
+            DeviceMac = config.Debug ? snapshot.DeviceMac : null,
             DeviceSerial = config.Debug ? snapshot.DeviceSerial : null,
             DeviceType = config.Debug ? snapshot.DeviceType : null,
             FirmwareVersion = config.Debug ? snapshot.FirmwareVersion : null,
