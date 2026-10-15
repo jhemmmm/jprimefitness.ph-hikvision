@@ -81,6 +81,7 @@ static void RegisterServices(IServiceCollection services, HikVisionConfig config
     services.AddSingleton<AttendanceCallbackProbeService>();
     services.AddSingleton<DeviceAutoConfigService>();
     services.AddHttpClient<AttendanceForwardService>();
+    services.AddHostedService<DeviceClockSyncService>();
 }
 
 static void MapEndpoints(WebApplication app)

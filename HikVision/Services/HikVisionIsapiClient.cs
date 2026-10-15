@@ -649,6 +649,67 @@ public class HikVisionIsapiClient : IDisposable
         }
     }
 
+    /// <summary>
+    /// Sets the device clock from this PC when it has drifted more than <paramref name="tolerance"/>.
+    /// Attendance is recorded with the device's event time, so a drifting terminal clock shifts every time-in/out.
+    /// Returns the drift measured before any correction (positive = device ahead), or null when it could not be read.
+    /// </summary>
+    public async Task<TimeSpan?> SyncDeviceClockAsync(TimeSpan tolerance)
+    {
+        const string path = "/ISAPI/System/time";
+
+        try
+        {
+            var getResponse = await _httpClient.GetAsync(DeviceUrl(path));
+            var currentXml = await getResponse.Content.ReadAsStringAsync();
+            if (!getResponse.IsSuccessStatusCode)
+            {
+                Log.Warning("ISAPI: Could not read device clock. HTTP {StatusCode}", getResponse.StatusCode);
+                return null;
+            }
+
+            var deviceTime = IsapiTimeXml.ReadLocalTime(currentXml);
+            if (deviceTime is null)
+            {
+                Log.Warning("ISAPI: Device clock response had no readable localTime. Body={Body}", currentXml);
+                return null;
+            }
+
+            var now = DateTimeOffset.Now;
+            var drift = deviceTime.Value - now;
+            if (drift.Duration() <= tolerance)
+            {
+                Log.Information("ISAPI: Device clock is within tolerance. drift={DriftSeconds:F0}s", drift.TotalSeconds);
+                return drift;
+            }
+
+            var putResponse = await _httpClient.PutAsync(
+                DeviceUrl(path),
+                new StringContent(IsapiTimeXml.ToManual(currentXml, now), System.Text.Encoding.UTF8, "application/xml"));
+            var responseBody = await putResponse.Content.ReadAsStringAsync();
+
+            if (putResponse.IsSuccessStatusCode)
+            {
+                Log.Warning("ISAPI: Device clock was off by {DriftSeconds:F0}s; set it to the PC time {Now}", drift.TotalSeconds, now);
+            }
+            else
+            {
+                Log.Warning(
+                    "ISAPI: Device clock is off by {DriftSeconds:F0}s but setting it failed. HTTP {StatusCode}. Response: {Body}",
+                    drift.TotalSeconds,
+                    putResponse.StatusCode,
+                    responseBody);
+            }
+
+            return drift;
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "ISAPI: Device clock sync failed");
+            return null;
+        }
+    }
+
     public async Task<(string Status, string Message, int HttpStatusCode, string? CallbackUrl, int HostId, string? RawResponse)> ConfigureAttendanceCallbackAsync(string callbackUrl, int? hostId)
     {
         try
